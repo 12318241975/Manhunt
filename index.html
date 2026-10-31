@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Manhunt">
+<title>Manhunt</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{--bg:#eef1ea;--ink:#17231c;--line:#c9d1c3;--run:#e8590c;--ok:#2b7a4b}
+*{box-sizing:border-box}[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+body{font:16px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink);padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+#home{max-width:420px;margin:0 auto;padding:32px 20px}
+h1{font-size:2rem;margin:0 0 4px}
+p.sub{margin:0 0 24px;color:#4a5a50}
+label{display:block;font-weight:600;margin:16px 0 6px}
+input{width:100%;padding:12px;font-size:1.1rem;border:2px solid var(--ink);border-radius:6px;background:#fff;text-transform:uppercase}
+.row{display:flex;gap:10px;margin-top:10px}
+button{flex:1;padding:14px;font-size:1rem;font-weight:700;border:2px solid var(--ink);border-radius:6px;background:#fff;color:var(--ink)}
+button.run{background:var(--run);color:#fff;border-color:var(--run)}
+button.hunt{background:var(--ink);color:#fff}
+#err{color:#b00020;min-height:1.4em;margin-top:12px}
+#game{height:100%;display:flex;flex-direction:column}
+#bar{padding:10px 14px;background:var(--ink);color:#fff;display:flex;justify-content:space-between;align-items:center;gap:10px}
+#bar.live{background:var(--ok)}
+#bar button{flex:none;padding:8px 14px;background:#fff}
+#map{flex:1}
+</style>
+</head>
+<body>
+<section id="home">
+  <h1>Manhunt</h1>
+  <p class="sub">The runner shares a location ping every 2 minutes. Hunters watch the map.</p>
+  <label for="code">Room code</label>
+  <input id="code" maxlength="6" autocomplete="off" placeholder="e.g. K7QX">
+  <div class="row"><button id="gen">New code</button></div>
+  <div class="row">
+    <button class="run" id="runner">I'm the runner</button>
+    <button class="hunt" id="hunter">I'm a hunter</button>
+  </div>
+  <div id="err"></div>
+</section>
+
+<section id="game" hidden>
+  <div id="bar"><span id="status"></span><button id="stop">Leave</button></div>
+  <div id="map"></div>
+</section>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// 1. Paste your Firebase web app config here (Firebase console > Project settings > Your apps)
+const firebaseConfig = {
+  apiKey: "AIzaSyB0olMLfvD01VFpVoBpPP6EvaFsuBcyfAY",
+  authDomain: "manhunt-v3.firebaseapp.com",
+  projectId: "manhunt-v3",
+  appId: "1:55593863408:web:65b47ee72f635581d5da35"
+};
+
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const $ = id => document.getElementById(id);
+const INTERVAL = 120000;
+
+let role, room, map, dot, trail, tick, pinger, unsub, wakeLock, lastTs = 0, firstFix = true;
+
+$('gen').onclick = () => $('code').value = Math.random().toString(36).slice(2, 6).toUpperCase();
+$('runner').onclick = () => start('runner');
+$('hunter').onclick = () => start('hunter');
+$('stop').onclick = stop;
+
+function setStatus(text, live) {
+  $('status').textContent = text;
+  $('bar').classList.toggle('live', !!live);
+}
+
+function fmtCountdown() {
+  if (!lastTs) return '';
+  const s = Math.max(0, Math.round((lastTs + INTERVAL - Date.now()) / 1000));
+  return 'next ping in ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+async function start(r) {
+  const code = $('code').value.trim().toUpperCase();
+  if (!code) { $('err').textContent = 'Enter or generate a room code first.'; return; }
+  if (r === 'runner' && !navigator.geolocation) { $('err').textContent = 'This browser cannot share location.'; return; }
+  role = r;
+  room = db.collection('rooms').doc(code);
+  $('home').hidden = true;
+  $('game').hidden = false;
+  initMap();
+
+  if (role === 'runner') {
+    await room.set({ active: true, last: null, trail: [] });
+    setStatus('Starting…', true);
+    ping();
+    pinger = setInterval(ping, INTERVAL);
+    keepAwake();
+    tick = setInterval(() => setStatus('Sharing location · ' + fmtCountdown(), true), 1000);
+  } else {
+    setStatus('Waiting for the runner…');
+    unsub = room.onSnapshot(snap => {
+      const d = snap.data();
+      if (!d || !d.last) return;
+      lastTs = d.last.ts;
+      draw(d.last, d.trail || []);
+    });
+    tick = setInterval(() => {
+      if (lastTs) setStatus('Runner pinged ' + Math.round((Date.now() - lastTs) / 1000) + 's ago · ' + fmtCountdown());
+    }, 1000);
+  }
+}
+
+function initMap() {
+  if (!map) {
+    map = L.map('map').setView([20, 0], 2);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+  }
+  setTimeout(() => map.invalidateSize(), 50);
+  if (dot) { map.removeLayer(dot); dot = null; }
+  if (trail) { map.removeLayer(trail); trail = null; }
+  firstFix = true;
+  lastTs = 0;
+}
+
+function draw(pt, history) {
+  const ll = [pt.lat, pt.lng];
+  if (!dot) dot = L.circleMarker(ll, { radius: 10, color: '#fff', weight: 3, fillColor: '#e8590c', fillOpacity: 1 }).addTo(map);
+  else dot.setLatLng(ll);
+  const line = history.map(p => [p.lat, p.lng]);
+  if (!trail) trail = L.polyline(line, { color: '#e8590c', weight: 3, dashArray: '6 8' }).addTo(map);
+  else trail.setLatLngs(line);
+  if (firstFix) { map.setView(ll, 16); firstFix = false; }
+  else map.panTo(ll);
+}
+
+function ping() {
+  navigator.geolocation.getCurrentPosition(async p => {
+    const pt = { lat: p.coords.latitude, lng: p.coords.longitude, ts: Date.now() };
+    lastTs = pt.ts;
+    draw(pt, []);
+    try {
+      await room.update({ active: true, last: pt, trail: firebase.firestore.FieldValue.arrayUnion(pt) });
+    } catch (e) { setStatus('Could not send ping: ' + e.message, true); }
+  }, e => setStatus('Location error: ' + e.message, true),
+  { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+}
+
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (role === 'runner' && pinger && document.visibilityState === 'visible') { keepAwake(); ping(); }
+});
+
+async function stop() {
+  clearInterval(pinger); clearInterval(tick); pinger = null;
+  if (unsub) { unsub(); unsub = null; }
+  if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
+  if (role === 'runner' && room) { try { await room.update({ active: false }); } catch (e) {} }
+  $('game').hidden = true;
+  $('home').hidden = false;
+  $('err').textContent = '';
+}
+</script>
+</body>
+</html>
