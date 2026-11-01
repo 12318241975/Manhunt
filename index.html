@@ -27,6 +27,10 @@ button.hunt{background:var(--ink);color:#fff}
 #bar.live{background:var(--ok)}
 #bar button{flex:none;padding:8px 14px;background:#fff}
 #map{flex:1}
+#bar .btns{display:flex;gap:8px}
+.me{width:40px;height:40px;transform-origin:50% 55%;transition:transform .2s}
+.me .hd{opacity:0}
+.me.has .hd{opacity:1}
 </style>
 </head>
 <body>
@@ -44,7 +48,7 @@ button.hunt{background:var(--ink);color:#fff}
 </section>
 
 <section id="game" hidden>
-  <div id="bar"><span id="status"></span><button id="stop">Leave</button></div>
+  <div id="bar"><span id="status"></span><div class="btns"><button id="center">Me</button><button id="stop">Leave</button></div></div>
   <div id="map"></div>
 </section>
 
@@ -66,11 +70,13 @@ const $ = id => document.getElementById(id);
 const INTERVAL = 120000;
 
 let role, room, map, dot, trail, tick, pinger, unsub, wakeLock, lastTs = 0, firstFix = true;
+let me, watchId, lastHeading = null, compassOn = false;
 
 $('gen').onclick = () => $('code').value = Math.random().toString(36).slice(2, 6).toUpperCase();
 $('runner').onclick = () => start('runner');
 $('hunter').onclick = () => start('hunter');
 $('stop').onclick = stop;
+$('center').onclick = () => { if (me) map.setView(me.getLatLng(), Math.max(map.getZoom(), 16)); };
 
 function setStatus(text, live) {
   $('status').textContent = text;
@@ -88,10 +94,12 @@ async function start(r) {
   if (!code) { $('err').textContent = 'Enter or generate a room code first.'; return; }
   if (r === 'runner' && !navigator.geolocation) { $('err').textContent = 'This browser cannot share location.'; return; }
   role = r;
+  enableCompass(); // must run straight from the tap so iPhone shows its motion permission prompt
   room = db.collection('rooms').doc(code);
   $('home').hidden = true;
   $('game').hidden = false;
   initMap();
+  watchMe();
 
   if (role === 'runner') {
     await room.set({ active: true, last: null, trail: [] });
@@ -158,8 +166,64 @@ document.addEventListener('visibilitychange', () => {
   if (role === 'runner' && pinger && document.visibilityState === 'visible') { keepAwake(); ping(); }
 });
 
+// Your own position and facing direction. Shown only on your own screen, never sent to Firebase.
+function meIcon() {
+  return L.divIcon({
+    className: '', iconSize: [40, 40], iconAnchor: [20, 22],
+    html: '<div class="me"><svg viewBox="0 0 40 40" width="40" height="40">' +
+      '<path class="hd" d="M20 1 L28 15 L20 11 L12 15 Z" fill="#1d4ed8" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>' +
+      '<circle cx="20" cy="22" r="7" fill="#1d4ed8" stroke="#fff" stroke-width="3"/></svg></div>'
+  });
+}
+
+function applyHeading() {
+  if (!me || lastHeading == null || !me.getElement()) return;
+  const el = me.getElement().firstChild;
+  el.classList.add('has');
+  el.style.transform = 'rotate(' + lastHeading + 'deg)';
+}
+
+function watchMe() {
+  if (!navigator.geolocation) return;
+  watchId = navigator.geolocation.watchPosition(p => {
+    const ll = [p.coords.latitude, p.coords.longitude];
+    if (!me) me = L.marker(ll, { icon: meIcon(), interactive: false, zIndexOffset: 1000 }).addTo(map);
+    else me.setLatLng(ll);
+    // Fallback when there is no compass: use direction of travel while moving
+    if (!compassOn && typeof p.coords.heading === 'number' && !isNaN(p.coords.heading) && (p.coords.speed || 0) > 0.5) {
+      lastHeading = p.coords.heading;
+    }
+    applyHeading();
+  }, () => {}, { enableHighAccuracy: true, maximumAge: 2000 });
+}
+
+function onOrient(e) {
+  let h = null;
+  if (typeof e.webkitCompassHeading === 'number') h = e.webkitCompassHeading;   // iPhone
+  else if (e.absolute && typeof e.alpha === 'number') h = 360 - e.alpha;         // Android
+  if (h == null) return;
+  compassOn = true;
+  lastHeading = h;
+  applyHeading();
+}
+
+async function enableCompass() {
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      if (await DeviceOrientationEvent.requestPermission() !== 'granted') return;
+    }
+    window.addEventListener('deviceorientationabsolute', onOrient, true);
+    window.addEventListener('deviceorientation', onOrient, true);
+  } catch (e) {}
+}
+
 async function stop() {
   clearInterval(pinger); clearInterval(tick); pinger = null;
+  if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  window.removeEventListener('deviceorientationabsolute', onOrient, true);
+  window.removeEventListener('deviceorientation', onOrient, true);
+  if (me && map) { map.removeLayer(me); }
+  me = null; lastHeading = null; compassOn = false;
   if (unsub) { unsub(); unsub = null; }
   if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
   if (role === 'runner' && room) { try { await room.update({ active: false }); } catch (e) {} }
