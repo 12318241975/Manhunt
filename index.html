@@ -8,7 +8,7 @@
 <title>Manhunt</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
-:root{--bg:#eef1ea;--ink:#17231c;--line:#c9d1c3;--run:#e8590c;--ok:#2b7a4b}
+:root{--bg:#eef1ea;--ink:#17231c;--ok:#2b7a4b}
 *{box-sizing:border-box}[hidden]{display:none!important}
 html,body{height:100%;margin:0}
 body{font:16px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink);padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
@@ -16,10 +16,12 @@ body{font:16px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink);pa
 h1{font-size:2rem;margin:0 0 4px}
 p.sub{margin:0 0 24px;color:#4a5a50}
 label{display:block;font-weight:600;margin:16px 0 6px}
+label span{font-weight:400;color:#4a5a50;font-size:.85rem}
 input{width:100%;padding:12px;font-size:1.1rem;border:2px solid var(--ink);border-radius:6px;background:#fff;text-transform:uppercase}
+#name{text-transform:none}
 .row{display:flex;gap:10px;margin-top:10px}
 button{flex:1;padding:14px;font-size:1rem;font-weight:700;border:2px solid var(--ink);border-radius:6px;background:#fff;color:var(--ink)}
-button.run{background:var(--run);color:#fff;border-color:var(--run)}
+button.run{background:#e8590c;color:#fff;border-color:#e8590c}
 button.hunt{background:var(--ink);color:#fff}
 #err{color:#b00020;min-height:1.4em;margin-top:12px}
 #ver{margin-top:28px;font-size:.8rem;color:#6b7a70}
@@ -27,8 +29,12 @@ button.hunt{background:var(--ink);color:#fff}
 #bar{padding:10px 14px;background:var(--ink);color:#fff;display:flex;justify-content:space-between;align-items:center;gap:10px}
 #bar.live{background:var(--ok)}
 #bar button{flex:none;padding:8px 14px;background:#fff}
-#map{flex:1}
 #bar .btns{display:flex;gap:8px}
+#legend{display:flex;flex-wrap:wrap;gap:6px;padding:6px 10px;background:#fff;border-bottom:2px solid var(--ink)}
+#legend:empty{display:none}
+.chip{flex:none;display:inline-flex;align-items:center;gap:6px;padding:5px 12px;font-size:.9rem;font-weight:600;border:2px solid var(--ink);border-radius:99px;background:#fff}
+.chip i{width:12px;height:12px;border-radius:50%;display:inline-block}
+#map{flex:1}
 .me{width:40px;height:40px;transform-origin:50% 55%;transition:transform .2s}
 .me .hd{opacity:0}
 .me.has .hd{opacity:1}
@@ -37,20 +43,23 @@ button.hunt{background:var(--ink);color:#fff}
 <body>
 <section id="home">
   <h1>Manhunt</h1>
-  <p class="sub">The runner shares a location ping every 2 minutes. Hunters watch the map.</p>
+  <p class="sub">Runners share a location ping every 2 minutes. Hunters watch the map.</p>
   <label for="code">Room code</label>
   <input id="code" maxlength="6" autocomplete="off" placeholder="e.g. K7QX">
   <div class="row"><button id="gen">New code</button></div>
+  <label for="name">Your name <span>(optional, hunters see it if you run)</span></label>
+  <input id="name" maxlength="12" autocomplete="off" placeholder="e.g. Sam">
   <div class="row">
-    <button class="run" id="runner">I'm the runner</button>
+    <button class="run" id="runner">I'm a runner</button>
     <button class="hunt" id="hunter">I'm a hunter</button>
   </div>
   <div id="err"></div>
-  <div id="ver">Version 5</div>
+  <div id="ver">Version 6</div>
 </section>
 
 <section id="game" hidden>
   <div id="bar"><span id="status"></span><div class="btns"><button id="compass" hidden>Compass</button><button id="center">Me</button><button id="stop">Leave</button></div></div>
+  <div id="legend"></div>
   <div id="map"></div>
 </section>
 
@@ -58,7 +67,6 @@ button.hunt{background:var(--ink);color:#fff}
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-// 1. Paste your Firebase web app config here (Firebase console > Project settings > Your apps)
 const firebaseConfig = {
   apiKey: "AIzaSyB0olMLfvD01VFpVoBpPP6EvaFsuBcyfAY",
   authDomain: "manhunt-v3.firebaseapp.com",
@@ -69,14 +77,22 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const INTERVAL = 120000;
-
-let role, room, map, dot, trail, tick, pinger, unsub, wakeLock, lastTs = 0, firstFix = true;
-let me, watchId, lastHeading = null, compassOn = false;
-let accCircle, retryTimer, gpsAcc = null, gpsErr = '', centeredOnMe = false, session = 0;
+const AVG_WINDOW = 12000;    // ms of GPS readings averaged into each ping
+const PALETTE = [
+  { name: 'Red', hex: '#d62828' }, { name: 'Orange', hex: '#f77f00' }, { name: 'Gold', hex: '#a67c00' },
+  { name: 'Green', hex: '#2b9348' }, { name: 'Teal', hex: '#0f8b8d' }, { name: 'Purple', hex: '#7b2cbf' },
+  { name: 'Pink', hex: '#e5389b' }, { name: 'Brown', hex: '#7f5539' }
+];
 const needsCompassTap = typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function';
+
+let role, room, map, tick, pinger, unsub, wakeLock, firstFix = true, lastTs = 0, session = 0;
+let myId, myColor, myLabel, myTrail = [], runnersData = {};
+let me, watchId, lastHeading = null, compassOn = false, centeredOnMe = false;
+let retryTimer, gpsAcc = null, gpsErr = '';
+const marks = {};            // runner id -> map layers
 const fixes = [];            // recent GPS readings, newest last
-const AVG_WINDOW = 12000;    // ms of readings averaged into each ping
 
 $('gen').onclick = () => $('code').value = Math.random().toString(36).slice(2, 6).toUpperCase();
 $('runner').onclick = () => start('runner');
@@ -84,6 +100,13 @@ $('hunter').onclick = () => start('hunter');
 $('stop').onclick = stop;
 $('compass').onclick = async () => { await enableCompass(); $('compass').hidden = true; };
 $('center').onclick = () => { if (me) map.setView(me.getLatLng(), Math.max(map.getZoom(), 16)); };
+$('legend').onclick = e => {
+  const b = e.target.closest('[data-id]');
+  if (!b) return;
+  if (b.dataset.id === 'all') return fitAll();
+  const m = marks[b.dataset.id];
+  if (m) map.setView(m.dot.getLatLng(), Math.max(map.getZoom(), 16));
+};
 
 function setStatus(text, live) {
   $('status').textContent = text;
@@ -95,10 +118,9 @@ function gpsText() {
   return gpsAcc != null ? ' · GPS ±' + Math.round(gpsAcc) + ' m' : '';
 }
 
-function fmtCountdown() {
-  if (!lastTs) return '';
-  const s = Math.max(0, Math.round((lastTs + INTERVAL - Date.now()) / 1000));
-  return 'next ping in ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+function fmtMS(ms) {
+  const s = Math.round(ms / 1000);
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
 async function start(r) {
@@ -116,26 +138,38 @@ async function start(r) {
   watchMe();
 
   if (role === 'runner') {
-    await room.set({ active: true, last: null, trail: [] });
+    setStatus('Joining…', true);
+    try { await joinAsRunner(); } catch (e) { setStatus('Could not join: ' + e.message, true); return; }
     if (sid !== session) return;
-    setStatus('Getting a GPS fix…', true);
+    $('bar').style.background = myColor;
     keepAwake();
-    tick = setInterval(() => setStatus((lastTs ? 'Sharing location · ' + fmtCountdown() : 'Getting a GPS fix…') + gpsText(), true), 1000);
+    tick = setInterval(() => setStatus((lastTs ? 'Sharing as ' + myLabel + ' · next ping in ' + fmtMS(Math.max(0, lastTs + INTERVAL - Date.now())) : 'Getting a GPS fix…') + gpsText(), true), 1000);
     await firstPing(sid);
     if (sid !== session) return;
     pinger = setInterval(ping, INTERVAL);
   } else {
-    setStatus('Waiting for the runner…');
+    setStatus('Waiting for the runners…');
     unsub = room.onSnapshot(snap => {
-      const d = snap.data();
-      if (!d || !d.last) return;
-      lastTs = d.last.ts;
-      draw(d.last, d.trail || []);
-    });
-    tick = setInterval(() => {
-      setStatus((lastTs ? 'Runner pinged ' + Math.round((Date.now() - lastTs) / 1000) + 's ago · ' + fmtCountdown() : 'Waiting for the runner…') + gpsText());
-    }, 1000);
+      runnersData = (snap.data() || {}).runners || {};
+      renderRunners();
+    }, e => setStatus('Connection error: ' + e.message));
+    tick = setInterval(updateHunterUi, 1000);
   }
+}
+
+// Each runner gets a random color nobody else in the room is using
+async function joinAsRunner() {
+  const snap = await room.get();
+  const runners = (snap.exists && snap.data().runners) || {};
+  const used = Object.values(runners).filter(x => x.active).map(x => x.color);
+  const free = PALETTE.filter(c => !used.includes(c.hex));
+  const pool = free.length ? free : PALETTE;
+  const c = pool[Math.floor(Math.random() * pool.length)];
+  myId = Math.random().toString(36).slice(2, 8);
+  myColor = c.hex;
+  myLabel = $('name').value.trim() || c.name;
+  myTrail = [];
+  await room.set({ runners: { [myId]: { label: myLabel, color: myColor, active: true, last: null, trail: [] } } }, { merge: true });
 }
 
 function initMap() {
@@ -146,30 +180,72 @@ function initMap() {
     }).addTo(map);
   }
   setTimeout(() => map.invalidateSize(), 50);
-  if (dot) { map.removeLayer(dot); dot = null; }
-  if (trail) { map.removeLayer(trail); trail = null; }
-  if (accCircle) { map.removeLayer(accCircle); accCircle = null; }
+  Object.keys(marks).forEach(removeMark);
   firstFix = true;
   centeredOnMe = false;
   lastTs = 0;
 }
 
-function draw(pt, history) {
-  const ll = [pt.lat, pt.lng];
-  if (!dot) dot = L.circleMarker(ll, { radius: 10, color: '#fff', weight: 3, fillColor: '#e8590c', fillOpacity: 1 }).addTo(map);
-  else dot.setLatLng(ll);
-  if (pt.acc) {
-    if (!accCircle) accCircle = L.circle(ll, { radius: pt.acc, color: '#e8590c', weight: 1, fillOpacity: 0.12 }).addTo(map);
-    else accCircle.setLatLng(ll).setRadius(pt.acc);
+function removeMark(id) {
+  const m = marks[id];
+  if (!m) return;
+  map.removeLayer(m.dot); map.removeLayer(m.ring); map.removeLayer(m.line);
+  delete marks[id];
+}
+
+function drawRunner(id, r) {
+  const ll = [r.last.lat, r.last.lng];
+  let m = marks[id];
+  if (!m) {
+    m = marks[id] = {
+      dot: L.circleMarker(ll, { radius: 10, color: '#fff', weight: 3, fillColor: r.color, fillOpacity: 1 }).addTo(map),
+      ring: L.circle(ll, { radius: r.last.acc || 0, color: r.color, weight: 1, fillOpacity: 0.12 }).addTo(map),
+      line: L.polyline([], { color: r.color, weight: 3, dashArray: '6 8' }).addTo(map)
+    };
+    m.dot.bindTooltip(esc(r.label), { permanent: true, direction: 'top', offset: [0, -10] });
   }
-  const line = history.map(p => [p.lat, p.lng]);
-  if (!trail) trail = L.polyline(line, { color: '#e8590c', weight: 3, dashArray: '6 8' }).addTo(map);
-  else trail.setLatLngs(line);
-  if (firstFix) {
-    firstFix = false;
-    if (me) map.fitBounds([ll, me.getLatLng()], { padding: [60, 60], maxZoom: 17 });
-    else map.setView(ll, 16);
-  } else if (!map.getBounds().contains(ll)) map.panTo(ll);
+  m.dot.setLatLng(ll);
+  m.ring.setLatLng(ll).setRadius(r.last.acc || 0);
+  m.line.setLatLngs((r.trail || []).map(p => [p.lat, p.lng]));
+}
+
+function fitAll() {
+  const pts = Object.values(marks).map(m => m.dot.getLatLng());
+  if (me) pts.push(me.getLatLng());
+  if (pts.length) map.fitBounds(pts, { padding: [60, 60], maxZoom: 17 });
+}
+
+function afterDraw() {
+  if (firstFix && Object.keys(marks).length) { firstFix = false; fitAll(); }
+}
+
+// Hunter view: draw every active runner that has pinged at least once
+function renderRunners() {
+  for (const id of Object.keys(marks)) {
+    const r = runnersData[id];
+    if (!r || !r.last || r.active === false) removeMark(id);
+  }
+  for (const [id, r] of Object.entries(runnersData)) {
+    if (r.last && r.active !== false) drawRunner(id, r);
+  }
+  afterDraw();
+  updateHunterUi();
+}
+
+function updateHunterUi() {
+  const ids = Object.keys(runnersData).filter(id => runnersData[id].active !== false);
+  setStatus((ids.length ? 'Hunting · ' + ids.length + (ids.length === 1 ? ' runner' : ' runners') : 'Waiting for the runners…') + gpsText());
+  const now = Date.now();
+  const chips = ids.map(id => {
+    const r = runnersData[id];
+    let info = 'waiting';
+    if (r.last) {
+      const left = r.last.ts + INTERVAL - now;
+      info = left > -20000 ? 'next ' + fmtMS(Math.max(0, left)) : Math.round((now - r.last.ts) / 60000) + ' min ago';
+    }
+    return '<button class="chip" data-id="' + id + '"><i style="background:' + esc(r.color) + '"></i>' + esc(r.label) + ' · ' + info + '</button>';
+  });
+  $('legend').innerHTML = chips.length ? '<button class="chip" data-id="all">All</button>' + chips.join('') : '';
 }
 
 async function firstPing(sid) {
@@ -200,18 +276,14 @@ async function ping() {
   for (const f of recent) { const k = 1 / (f.acc * f.acc); w += k; lat += f.lat * k; lng += f.lng * k; }
   const pt = { lat: lat / w, lng: lng / w, acc: Math.round(best), ts: Date.now() };
   lastTs = pt.ts;
-  draw(pt, []);
+  myTrail.push(pt);
+  drawRunner(myId, { label: myLabel, color: myColor, last: pt, trail: myTrail });
+  afterDraw();
+  const k = 'runners.' + myId;
   try {
-    await room.update({ active: true, last: pt, trail: firebase.firestore.FieldValue.arrayUnion(pt) });
+    await room.update({ [k + '.active']: true, [k + '.last']: pt, [k + '.trail']: firebase.firestore.FieldValue.arrayUnion(pt) });
   } catch (e) { setStatus('Could not send ping: ' + e.message, true); }
 }
-
-async function keepAwake() {
-  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
-}
-document.addEventListener('visibilitychange', () => {
-  if (role === 'runner' && pinger && document.visibilityState === 'visible') { keepAwake(); ping(); }
-});
 
 // Your own position and facing direction. Shown only on your own screen, never sent to Firebase.
 function meIcon() {
@@ -246,7 +318,8 @@ function watchMe() {
       lastHeading = p.coords.heading;
     }
     applyHeading();
-  }, e => { gpsErr = e.code === 1 ? 'location blocked, check Safari site settings' : 'GPS error: ' + e.message; }, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+  }, e => { gpsErr = e.code === 1 ? 'location blocked, check Safari site settings' : 'GPS error: ' + e.message; },
+  { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
 }
 
 function onOrient(e) {
@@ -261,17 +334,23 @@ function onOrient(e) {
 
 async function enableCompass() {
   try {
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-      if (await DeviceOrientationEvent.requestPermission() !== 'granted') return;
-    }
+    if (needsCompassTap && await DeviceOrientationEvent.requestPermission() !== 'granted') return;
     window.addEventListener('deviceorientationabsolute', onOrient, true);
     window.addEventListener('deviceorientation', onOrient, true);
   } catch (e) {}
 }
 
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (role === 'runner' && pinger && document.visibilityState === 'visible') { keepAwake(); ping(); }
+});
+
 async function stop() {
   session++; clearTimeout(retryTimer);
   clearInterval(pinger); clearInterval(tick); pinger = null;
+  if (unsub) { unsub(); unsub = null; }
   if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   window.removeEventListener('deviceorientationabsolute', onOrient, true);
   window.removeEventListener('deviceorientation', onOrient, true);
@@ -279,9 +358,14 @@ async function stop() {
   me = null; lastHeading = null; compassOn = false;
   fixes.length = 0; gpsAcc = null; gpsErr = '';
   $('compass').hidden = true;
-  if (unsub) { unsub(); unsub = null; }
+  $('bar').style.background = '';
   if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
-  if (role === 'runner' && room) { try { await room.update({ active: false }); } catch (e) {} }
+  if (role === 'runner' && room && myId) {
+    try { await room.update({ ['runners.' + myId + '.active']: false }); } catch (e) {}
+  }
+  Object.keys(marks).forEach(removeMark);
+  runnersData = {}; myId = null; myTrail = [];
+  $('legend').innerHTML = '';
   $('game').hidden = true;
   $('home').hidden = false;
   $('err').textContent = '';
