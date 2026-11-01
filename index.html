@@ -46,11 +46,11 @@ button.hunt{background:var(--ink);color:#fff}
     <button class="hunt" id="hunter">I'm a hunter</button>
   </div>
   <div id="err"></div>
-  <div id="ver">Version 4</div>
+  <div id="ver">Version 5</div>
 </section>
 
 <section id="game" hidden>
-  <div id="bar"><span id="status"></span><div class="btns"><button id="center">Me</button><button id="stop">Leave</button></div></div>
+  <div id="bar"><span id="status"></span><div class="btns"><button id="compass" hidden>Compass</button><button id="center">Me</button><button id="stop">Leave</button></div></div>
   <div id="map"></div>
 </section>
 
@@ -74,6 +74,7 @@ const INTERVAL = 120000;
 let role, room, map, dot, trail, tick, pinger, unsub, wakeLock, lastTs = 0, firstFix = true;
 let me, watchId, lastHeading = null, compassOn = false;
 let accCircle, retryTimer, gpsAcc = null, gpsErr = '', centeredOnMe = false, session = 0;
+const needsCompassTap = typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function';
 const fixes = [];            // recent GPS readings, newest last
 const AVG_WINDOW = 12000;    // ms of readings averaged into each ping
 
@@ -81,6 +82,7 @@ $('gen').onclick = () => $('code').value = Math.random().toString(36).slice(2, 6
 $('runner').onclick = () => start('runner');
 $('hunter').onclick = () => start('hunter');
 $('stop').onclick = stop;
+$('compass').onclick = async () => { await enableCompass(); $('compass').hidden = true; };
 $('center').onclick = () => { if (me) map.setView(me.getLatLng(), Math.max(map.getZoom(), 16)); };
 
 function setStatus(text, live) {
@@ -105,7 +107,8 @@ async function start(r) {
   if (r === 'runner' && !navigator.geolocation) { $('err').textContent = 'This browser cannot share location.'; return; }
   role = r;
   const sid = ++session;
-  enableCompass(); // must run straight from the tap so iPhone shows its motion permission prompt
+  // Android needs no permission. iPhone asks for motion access, which has its own button so it never competes with the location prompt.
+  if (needsCompassTap) $('compass').hidden = false; else enableCompass();
   room = db.collection('rooms').doc(code);
   $('home').hidden = true;
   $('game').hidden = false;
@@ -243,7 +246,7 @@ function watchMe() {
       lastHeading = p.coords.heading;
     }
     applyHeading();
-  }, e => { gpsErr = 'GPS error: ' + e.message; }, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+  }, e => { gpsErr = e.code === 1 ? 'location blocked, check Safari site settings' : 'GPS error: ' + e.message; }, { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
 }
 
 function onOrient(e) {
@@ -275,6 +278,7 @@ async function stop() {
   if (me && map) { map.removeLayer(me); }
   me = null; lastHeading = null; compassOn = false;
   fixes.length = 0; gpsAcc = null; gpsErr = '';
+  $('compass').hidden = true;
   if (unsub) { unsub(); unsub = null; }
   if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
   if (role === 'runner' && room) { try { await room.update({ active: false }); } catch (e) {} }
