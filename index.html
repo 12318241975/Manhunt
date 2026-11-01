@@ -23,6 +23,7 @@ input{width:100%;padding:12px;font-size:1.1rem;border:2px solid var(--ink);borde
 button{flex:1;padding:14px;font-size:1rem;font-weight:700;border:2px solid var(--ink);border-radius:6px;background:#fff;color:var(--ink)}
 button.run{background:#e8590c;color:#fff;border-color:#e8590c}
 button.hunt{background:var(--ink);color:#fff}
+#resume{background:#fff;border:2px solid var(--ink);border-radius:6px;padding:10px 12px;margin:0 0 16px}
 #err{color:#b00020;min-height:1.4em;margin-top:12px}
 #ver{margin-top:28px;font-size:.8rem;color:#6b7a70}
 #game{height:100%;display:flex;flex-direction:column}
@@ -30,7 +31,9 @@ button.hunt{background:var(--ink);color:#fff}
 #bar.live{background:var(--ok)}
 #bar button{flex:none;padding:8px 14px;background:#fff}
 #bar .btns{display:flex;gap:8px}
-#legend{display:flex;flex-wrap:wrap;gap:6px;padding:6px 10px;background:#fff;border-bottom:2px solid var(--ink)}
+#ctl{display:flex;gap:8px;padding:8px 10px;background:#fff;border-bottom:2px solid var(--ink)}
+#ctl button{padding:10px}
+#legend{display:flex;flex-wrap:wrap;gap:6px;padding:6px 10px;background:#fff;border-bottom:2px solid var(--ink);max-height:30vh;overflow-y:auto}
 #legend:empty{display:none}
 .chip{flex:none;display:inline-flex;align-items:center;gap:6px;padding:5px 12px;font-size:.9rem;font-weight:600;border:2px solid var(--ink);border-radius:99px;background:#fff}
 .chip i{width:12px;height:12px;border-radius:50%;display:inline-block}
@@ -44,6 +47,7 @@ button.hunt{background:var(--ink);color:#fff}
 <section id="home">
   <h1>Manhunt</h1>
   <p class="sub">Runners share a location ping every 2 minutes. Hunters watch the map.</p>
+  <p id="resume" hidden></p>
   <label for="code">Room code</label>
   <input id="code" maxlength="6" autocomplete="off" placeholder="e.g. K7QX">
   <div class="row"><button id="gen">New code</button></div>
@@ -54,11 +58,16 @@ button.hunt{background:var(--ink);color:#fff}
     <button class="hunt" id="hunter">I'm a hunter</button>
   </div>
   <div id="err"></div>
-  <div id="ver">Version 6</div>
+  <div id="ver">Version 8</div>
 </section>
 
 <section id="game" hidden>
   <div id="bar"><span id="status"></span><div class="btns"><button id="compass" hidden>Compass</button><button id="center">Me</button><button id="stop">Leave</button></div></div>
+  <div id="ctl" hidden>
+    <button class="run" id="startBtn" hidden>Start game</button>
+    <button id="endBtn" hidden>End game</button>
+    <button id="takeBtn" hidden>Take over as host</button>
+  </div>
   <div id="legend"></div>
   <div id="map"></div>
 </section>
@@ -78,16 +87,37 @@ firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const INTERVAL = 120000;
+const INTERVAL = 120000;     // time between pings
+const GRACE = 5 * 60 * 1000; // head start before any pings
 const AVG_WINDOW = 12000;    // ms of GPS readings averaged into each ping
 const PALETTE = [
-  { name: 'Red', hex: '#d62828' }, { name: 'Orange', hex: '#f77f00' }, { name: 'Gold', hex: '#a67c00' },
-  { name: 'Green', hex: '#2b9348' }, { name: 'Teal', hex: '#0f8b8d' }, { name: 'Purple', hex: '#7b2cbf' },
-  { name: 'Pink', hex: '#e5389b' }, { name: 'Brown', hex: '#7f5539' }
+  { name: 'Red', hex: '#d62828' }, { name: 'Maroon', hex: '#7a1f1f' }, { name: 'Coral', hex: '#ff6b5b' },
+  { name: 'Orange', hex: '#f77f00' }, { name: 'Amber', hex: '#ffb000' }, { name: 'Gold', hex: '#a67c00' },
+  { name: 'Olive', hex: '#6b7a00' }, { name: 'Lime', hex: '#6aa800' }, { name: 'Green', hex: '#2b9348' },
+  { name: 'Forest', hex: '#14532d' }, { name: 'Mint', hex: '#2ec4a0' }, { name: 'Teal', hex: '#0f8b8d' },
+  { name: 'Cyan', hex: '#00a3c4' }, { name: 'Sky', hex: '#3a9ad9' }, { name: 'Steel', hex: '#3d5a80' },
+  { name: 'Indigo', hex: '#4338ca' }, { name: 'Violet', hex: '#7b2cbf' }, { name: 'Lavender', hex: '#b08ee6' },
+  { name: 'Plum', hex: '#6a1b6a' }, { name: 'Magenta', hex: '#c2189a' }, { name: 'Pink', hex: '#e5389b' },
+  { name: 'Rose', hex: '#ff7fa8' }, { name: 'Peach', hex: '#f4a261' }, { name: 'Brown', hex: '#7f5539' },
+  { name: 'Tan', hex: '#b08968' }, { name: 'Rust', hex: '#b5451b' }, { name: 'Turquoise', hex: '#14b8a6' },
+  { name: 'Slate', hex: '#5c6b73' }, { name: 'Gray', hex: '#8d99ae' }, { name: 'Black', hex: '#111111' }
 ];
 const needsCompassTap = typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function';
 
-let role, room, map, tick, pinger, unsub, wakeLock, firstFix = true, lastTs = 0, session = 0;
+// Saved on this phone so a reload or reopened app rejoins as the same person
+const SKEY = 'manhunt.session';
+function loadSession() { try { return JSON.parse(localStorage.getItem(SKEY)); } catch (e) { return null; } }
+function saveSession(o) { try { localStorage.setItem(SKEY, JSON.stringify(o)); } catch (e) {} }
+function clearSession() { try { localStorage.removeItem(SKEY); } catch (e) {} }
+const hunterId = (() => {
+  const fresh = () => Math.random().toString(36).slice(2, 10);
+  try { let v = localStorage.getItem('manhunt.hunterId'); if (!v) { v = fresh(); localStorage.setItem('manhunt.hunterId', v); } return v; }
+  catch (e) { return fresh(); }
+})();
+
+let role, roomCode, gameRef, gameUnsub, myRef, map, tick, unsub, wakeLock;
+let firstFix = true, lastTs = 0, nextPing = 0, joinedAt = 0, session = 0, starting = false;
+let game = {}, offline = false;
 let myId, myColor, myLabel, myTrail = [], runnersData = {};
 let me, watchId, lastHeading = null, compassOn = false, centeredOnMe = false;
 let retryTimer, gpsAcc = null, gpsErr = '';
@@ -107,6 +137,27 @@ $('legend').onclick = e => {
   const m = marks[b.dataset.id];
   if (m) map.setView(m.dot.getLatLng(), Math.max(map.getZoom(), 16));
 };
+$('startBtn').onclick = () => {
+  if (confirm('Start the game? Runners get a 5-minute head start before any locations are shared.'))
+    gameRef.set({ state: 'running', startedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+};
+$('endBtn').onclick = () => {
+  if (confirm('End the game for everyone?'))
+    gameRef.set({ state: 'ended', endedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+};
+$('takeBtn').onclick = () => {
+  if (confirm('Take over as host? The current host will lose the Start and End buttons.'))
+    gameRef.set({ host: hunterId }, { merge: true });
+};
+
+(function showResume() {
+  const s = loadSession();
+  if (!s) return;
+  $('code').value = s.code;
+  $('resume').textContent = 'Last time you were in room ' + s.code + ' as ' + (s.role === 'runner' ? 'a runner (' + s.label + ')' : 'a hunter') +
+    '. Tap the same role to pick up where you left off.';
+  $('resume').hidden = false;
+})();
 
 function setStatus(text, live) {
   $('status').textContent = text;
@@ -117,59 +168,152 @@ function gpsText() {
   if (gpsErr) return ' · ' + gpsErr;
   return gpsAcc != null ? ' · GPS ±' + Math.round(gpsAcc) + ' m' : '';
 }
+function connText() { return offline ? ' · offline, reconnecting' : ''; }
+
+function isLight(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) > 160;
+}
 
 function fmtMS(ms) {
-  const s = Math.round(ms / 1000);
+  const s = Math.max(0, Math.round(ms / 1000));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
+// lobby (waiting for a hunter to start) -> grace (head start) -> live (pings) -> ended
+function startMs() { return game.startedAt ? game.startedAt.toMillis() : 0; }
+function phase() {
+  if (game.state === 'ended') return 'ended';
+  if (game.state !== 'running' || !game.startedAt) return 'lobby';
+  return Date.now() < startMs() + GRACE ? 'grace' : 'live';
+}
+
 async function start(r) {
+  if (starting) return;
+  starting = true;
+  try { await begin(r); } finally { starting = false; }
+}
+
+async function begin(r) {
   const code = $('code').value.trim().toUpperCase();
   if (!code) { $('err').textContent = 'Enter or generate a room code first.'; return; }
+  if (!/^[A-Z0-9]{2,6}$/.test(code)) { $('err').textContent = 'Room codes use letters and numbers only.'; return; }
   if (r === 'runner' && !navigator.geolocation) { $('err').textContent = 'This browser cannot share location.'; return; }
-  role = r;
+  const saved = loadSession();
+  const resume = !!(saved && saved.code === code && saved.role === r);
+  const ref = db.collection('rooms').doc(code);
+  if (r === 'runner' && !resume) {
+    try {
+      const g = await ref.get();
+      if (g.exists && g.data().state === 'ended') { $('err').textContent = 'That game has already ended. Use a new room code.'; return; }
+    } catch (e) { $('err').textContent = 'Could not reach the server: ' + e.message; return; }
+  }
+  role = r; roomCode = code; gameRef = ref;
   const sid = ++session;
   // Android needs no permission. iPhone asks for motion access, which has its own button so it never competes with the location prompt.
   if (needsCompassTap) $('compass').hidden = false; else enableCompass();
-  room = db.collection('rooms').doc(code);
   $('home').hidden = true;
   $('game').hidden = false;
+  $('ctl').hidden = true;
   initMap();
   watchMe();
+  watchGame();
+  nextPing = 0;
+  joinedAt = Date.now();
 
   if (role === 'runner') {
     setStatus('Joining…', true);
-    try { await joinAsRunner(); } catch (e) { setStatus('Could not join: ' + e.message, true); return; }
+    try { await joinAsRunner(resume ? saved : null); } catch (e) { setStatus('Could not join: ' + e.message, true); return; }
     if (sid !== session) return;
     $('bar').style.background = myColor;
+    $('bar').style.color = isLight(myColor) ? '#17231c' : '#fff';
     keepAwake();
-    tick = setInterval(() => setStatus((lastTs ? 'Sharing as ' + myLabel + ' · next ping in ' + fmtMS(Math.max(0, lastTs + INTERVAL - Date.now())) : 'Getting a GPS fix…') + gpsText(), true), 1000);
-    await firstPing(sid);
-    if (sid !== session) return;
-    pinger = setInterval(ping, INTERVAL);
+    tick = setInterval(runnerTick, 1000);
   } else {
-    setStatus('Waiting for the runners…');
-    unsub = room.onSnapshot(snap => {
-      runnersData = (snap.data() || {}).runners || {};
+    saveSession({ code, role: 'hunter' });
+    claimHost();
+    setStatus('Joining…');
+    unsub = db.collection('rooms').where('code', '==', roomCode).onSnapshot(snap => {
+      runnersData = {};
+      snap.forEach(d => { runnersData[d.id] = d.data(); });
       renderRunners();
     }, e => setStatus('Connection error: ' + e.message));
-    tick = setInterval(updateHunterUi, 1000);
+    tick = setInterval(hunterTick, 1000);
   }
 }
 
-// Each runner gets a random color nobody else in the room is using
-async function joinAsRunner() {
-  const snap = await room.get();
-  const runners = (snap.exists && snap.data().runners) || {};
-  const used = Object.values(runners).filter(x => x.active).map(x => x.color);
+// Game state (lobby / running / ended, host, start time) lives in one document per room
+function watchGame() {
+  gameUnsub = gameRef.onSnapshot({ includeMetadataChanges: true }, snap => {
+    game = snap.exists ? snap.data({ serverTimestampBehavior: 'estimate' }) : {};
+    offline = snap.metadata.fromCache;
+    if (role === 'hunter') refreshControls();
+  }, e => setStatus('Connection error: ' + e.message));
+}
+
+// The first hunter to join a room becomes the host
+async function claimHost() {
+  try {
+    await db.runTransaction(async tx => {
+      const s = await tx.get(gameRef);
+      if (!s.exists || !s.data().host) tx.set(gameRef, { host: hunterId, state: (s.exists && s.data().state) || 'lobby' }, { merge: true });
+    });
+  } catch (e) {}
+}
+
+function refreshControls() {
+  if (role !== 'hunter') { $('ctl').hidden = true; return; }
+  const ph = phase(), host = game.host === hunterId;
+  $('startBtn').hidden = !(host && ph === 'lobby');
+  $('endBtn').hidden = !(host && (ph === 'grace' || ph === 'live'));
+  $('takeBtn').hidden = host || !game.host || ph === 'ended';
+  $('ctl').hidden = $('startBtn').hidden && $('endBtn').hidden && $('takeBtn').hidden;
+}
+
+function pickColor(used) {
   const free = PALETTE.filter(c => !used.includes(c.hex));
   const pool = free.length ? free : PALETTE;
-  const c = pool[Math.floor(Math.random() * pool.length)];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function joinAsRunner(saved) {
+  // One document per runner, so many runners can ping at once without fighting over one record
+  if (saved) {
+    // Same phone, same room: pick up the same identity, color and trail
+    myId = saved.id;
+    myRef = db.collection('rooms').doc(roomCode + '-' + myId);
+    const d = (await myRef.get()).data();
+    myColor = (d && d.color) || saved.color;
+    myLabel = (d && d.label) || saved.label;
+    myTrail = (d && d.trail) || [];
+    await myRef.set(Object.assign({ code: roomCode, label: myLabel, color: myColor, active: true }, d ? {} : { last: null, trail: [] }), { merge: true });
+    if (d && d.last) {
+      lastTs = d.last.ts; nextPing = d.last.ts + INTERVAL;
+      drawRunner(myId, { label: myLabel, color: myColor, last: d.last, trail: myTrail });
+      afterDraw();
+    }
+    return;
+  }
   myId = Math.random().toString(36).slice(2, 8);
-  myColor = c.hex;
-  myLabel = $('name').value.trim() || c.name;
+  myRef = db.collection('rooms').doc(roomCode + '-' + myId);
   myTrail = [];
-  await room.set({ runners: { [myId]: { label: myLabel, color: myColor, active: true, last: null, trail: [] } } }, { merge: true });
+  const typed = $('name').value.trim();
+  const others = async () => {
+    const snap = await db.collection('rooms').where('code', '==', roomCode).get();
+    return snap.docs.filter(d => d.id !== myRef.id && d.data().active).map(d => ({ id: d.id, color: d.data().color }));
+  };
+  let c = pickColor((await others()).map(x => x.color));
+  myColor = c.hex; myLabel = typed || c.name;
+  await myRef.set({ code: roomCode, label: myLabel, color: myColor, active: true, last: null, trail: [] });
+  // If two runners picked the same color at the same moment, the one with the later id switches
+  for (let i = 0; i < 3; i++) {
+    const o = await others();
+    if (!o.some(x => x.color === myColor && x.id < myRef.id)) break;
+    c = pickColor(o.map(x => x.color));
+    myColor = c.hex; myLabel = typed || c.name;
+    await myRef.update({ color: myColor, label: myLabel });
+  }
+  saveSession({ code: roomCode, role: 'runner', id: myId, color: myColor, label: myLabel });
 }
 
 function initMap() {
@@ -232,35 +376,50 @@ function renderRunners() {
   updateHunterUi();
 }
 
+function hunterTick() { updateHunterUi(); refreshControls(); }
+
 function updateHunterUi() {
-  const ids = Object.keys(runnersData).filter(id => runnersData[id].active !== false);
-  setStatus((ids.length ? 'Hunting · ' + ids.length + (ids.length === 1 ? ' runner' : ' runners') : 'Waiting for the runners…') + gpsText());
-  const now = Date.now();
+  const ids = Object.keys(runnersData).filter(id => runnersData[id].active !== false)
+    .sort((a, b) => String(runnersData[a].label).localeCompare(String(runnersData[b].label)));
+  const n = ids.length, noun = n === 1 ? ' runner' : ' runners';
+  const ph = phase(), now = Date.now(), host = game.host === hunterId;
+  let text;
+  if (ph === 'lobby') text = 'Lobby · ' + n + noun + ' joined' + (host ? ' · tap Start when ready' : ' · waiting for the host');
+  else if (ph === 'grace') text = 'Head start · pings begin in ' + fmtMS(startMs() + GRACE - now);
+  else if (ph === 'ended') text = 'Game over';
+  else text = 'Hunting · ' + n + noun;
+  setStatus(text + gpsText() + connText());
   const chips = ids.map(id => {
     const r = runnersData[id];
-    let info = 'waiting';
-    if (r.last) {
+    let info;
+    if (!r.last) info = ph === 'lobby' ? 'joined' : ph === 'grace' ? 'head start' : 'waiting';
+    else if (ph === 'ended') info = 'final';
+    else {
       const left = r.last.ts + INTERVAL - now;
-      info = left > -20000 ? 'next ' + fmtMS(Math.max(0, left)) : Math.round((now - r.last.ts) / 60000) + ' min ago';
+      info = left > -20000 ? 'next ' + fmtMS(left) : Math.round((now - r.last.ts) / 60000) + ' min ago';
     }
-    return '<button class="chip" data-id="' + id + '"><i style="background:' + esc(r.color) + '"></i>' + esc(r.label) + ' · ' + info + '</button>';
+    return '<button class="chip" data-id="' + esc(id) + '"><i style="background:' + esc(r.color) + '"></i>' + esc(r.label) + ' · ' + info + '</button>';
   });
   $('legend').innerHTML = chips.length ? '<button class="chip" data-id="all">All</button>' + chips.join('') : '';
 }
 
-async function firstPing(sid) {
-  // Wait for a decent GPS fix so the very first ping is not a rough cell/Wi-Fi guess
-  const t0 = Date.now();
-  while (sid === session) {
-    const waited = Date.now() - t0;
-    const good = fixes.some(f => Date.now() - f.t < 3000 && f.acc <= 30);
-    if ((good && waited >= 6000) || waited >= 20000) break;
-    await new Promise(r => setTimeout(r, 500));
+// Runner loop: nothing is sent until the head start is over, then one ping every 2 minutes
+function runnerTick() {
+  const ph = phase(), now = Date.now();
+  if (ph === 'live' && now >= nextPing) {
+    const ready = lastTs > 0 || fixes.some(f => now - f.t < 3000 && f.acc <= 30) || now - joinedAt > 20000;
+    if (ready) { nextPing = now + INTERVAL; ping(); }
   }
-  if (sid === session) await ping();
+  let text;
+  if (ph === 'lobby') text = 'Waiting for a hunter to start the game';
+  else if (ph === 'grace') text = 'Head start! Pings begin in ' + fmtMS(startMs() + GRACE - now);
+  else if (ph === 'ended') text = 'Game over';
+  else text = lastTs ? 'Sharing as ' + myLabel + ' · next ping in ' + fmtMS(nextPing - now) : 'Getting a GPS fix…';
+  setStatus(text + gpsText() + connText(), true);
 }
 
 async function ping() {
+  if (phase() !== 'live') return;
   const now = Date.now();
   let recent = fixes.filter(f => now - f.t <= AVG_WINDOW);
   if (!recent.length) {
@@ -276,13 +435,14 @@ async function ping() {
   for (const f of recent) { const k = 1 / (f.acc * f.acc); w += k; lat += f.lat * k; lng += f.lng * k; }
   const pt = { lat: lat / w, lng: lng / w, acc: Math.round(best), ts: Date.now() };
   lastTs = pt.ts;
+  nextPing = pt.ts + INTERVAL;
   myTrail.push(pt);
+  if (myTrail.length > 40) myTrail.shift();
   drawRunner(myId, { label: myLabel, color: myColor, last: pt, trail: myTrail });
   afterDraw();
-  const k = 'runners.' + myId;
   try {
-    await room.update({ [k + '.active']: true, [k + '.last']: pt, [k + '.trail']: firebase.firestore.FieldValue.arrayUnion(pt) });
-  } catch (e) { setStatus('Could not send ping: ' + e.message, true); }
+    await myRef.update({ active: true, last: pt, trail: myTrail });
+  } catch (e) { gpsErr = 'could not send ping: ' + e.message; }
 }
 
 // Your own position and facing direction. Shown only on your own screen, never sent to Firebase.
@@ -344,13 +504,14 @@ async function keepAwake() {
   try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
 }
 document.addEventListener('visibilitychange', () => {
-  if (role === 'runner' && pinger && document.visibilityState === 'visible') { keepAwake(); ping(); }
+  if (role === 'runner' && myRef && document.visibilityState === 'visible') { keepAwake(); nextPing = 0; }
 });
 
 async function stop() {
   session++; clearTimeout(retryTimer);
-  clearInterval(pinger); clearInterval(tick); pinger = null;
+  clearInterval(tick);
   if (unsub) { unsub(); unsub = null; }
+  if (gameUnsub) { gameUnsub(); gameUnsub = null; }
   if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
   window.removeEventListener('deviceorientationabsolute', onOrient, true);
   window.removeEventListener('deviceorientation', onOrient, true);
@@ -358,14 +519,18 @@ async function stop() {
   me = null; lastHeading = null; compassOn = false;
   fixes.length = 0; gpsAcc = null; gpsErr = '';
   $('compass').hidden = true;
+  $('ctl').hidden = true;
   $('bar').style.background = '';
+  $('bar').style.color = '';
   if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
-  if (role === 'runner' && room && myId) {
-    try { await room.update({ ['runners.' + myId + '.active']: false }); } catch (e) {}
+  if (role === 'runner' && myRef) {
+    try { await myRef.update({ active: false }); } catch (e) {}
   }
+  clearSession();
   Object.keys(marks).forEach(removeMark);
-  runnersData = {}; myId = null; myTrail = [];
+  runnersData = {}; game = {}; offline = false; myId = null; myRef = null; myTrail = [];
   $('legend').innerHTML = '';
+  $('resume').hidden = true;
   $('game').hidden = true;
   $('home').hidden = false;
   $('err').textContent = '';
