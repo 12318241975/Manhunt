@@ -31,6 +31,8 @@ button.hunt{background:var(--ink);color:#fff}
 #bar.live{background:var(--ok)}
 #bar button{flex:none;padding:8px 14px;background:#fff}
 #bar .btns{display:flex;gap:8px}
+#room{font-weight:800;letter-spacing:.12em;font-size:.8rem;text-transform:uppercase;opacity:.85;margin-bottom:2px}
+#pwInput{text-transform:none}
 #ctl{display:flex;gap:8px;padding:8px 10px;background:#fff;border-bottom:2px solid var(--ink)}
 #ctl button{padding:10px}
 #settings{padding:4px 14px 12px;background:#fff;border-bottom:2px solid var(--ink)}
@@ -62,11 +64,11 @@ button.hunt{background:var(--ink);color:#fff}
     <button class="hunt" id="hunter">I'm a hunter</button>
   </div>
   <div id="err"></div>
-  <div id="ver">Version 10</div>
+  <div id="ver">Version 11</div>
 </section>
 
 <section id="game" hidden>
-  <div id="bar"><span id="status"></span><div class="btns"><button id="compass" hidden>Compass</button><button id="center">Me</button><button id="stop">Leave</button></div></div>
+  <div id="bar"><div><div id="room"></div><span id="status"></span></div><div class="btns"><button id="compass" hidden>Compass</button><button id="center">Me</button><button id="stop">Leave</button></div></div>
   <div id="ctl" hidden>
     <button class="run" id="startBtn" hidden>Start game</button>
     <button id="settingsBtn" hidden>Settings</button>
@@ -86,6 +88,10 @@ button.hunt{background:var(--ink);color:#fff}
       <option value="30">30 seconds</option><option value="60">1 minute</option><option value="120">2 minutes</option>
       <option value="180">3 minutes</option><option value="300">5 minutes</option><option value="600">10 minutes</option>
     </select>
+    <label for="pwInput">Hunter password <span>(optional, not case sensitive)</span></label>
+    <input id="pwInput" maxlength="20" autocomplete="off" autocapitalize="off" placeholder="Leave blank for none">
+    <div class="row"><button id="pwSave">Save password</button></div>
+    <p id="pwState"></p>
     <p>Shorter gaps between pings use more of Firebase's free daily limits. Settings lock once the game starts.</p>
   </div>
   <div id="legend"></div>
@@ -191,6 +197,7 @@ $('takeBtn').onclick = () => {
     gameRef.set({ host: hunterId, expireAt: exp() }, { merge: true });
 };
 $('settingsBtn').onclick = () => { settingsOpen = !settingsOpen; refreshControls(); };
+$('pwSave').onclick = savePassword;
 $('graceSel').onchange = $('intSel').onchange = () =>
   gameRef.set({ graceSec: +$('graceSel').value, intervalSec: +$('intSel').value, expireAt: exp() }, { merge: true });
 $('newBtn').onclick = async () => {
@@ -261,6 +268,22 @@ async function begin(r) {
   const resume = !!(saved && saved.code === code && saved.role === r);
   const ref = db.collection('rooms').doc(code);
   try { await purgeIfStale(code); } catch (e) {}   // a code left unused for 6 hours starts clean
+  let verified = null;   // hunter password hash this phone has proven it knows
+  if (r === 'hunter') {
+    try {
+      const g = await ref.get();
+      const d = g.exists ? g.data() : {};
+      if (d.pwHash) {
+        if (saved && saved.role === 'hunter' && saved.code === code && saved.pwHash === d.pwHash) verified = d.pwHash;
+        else {
+          const attempt = (prompt('This room needs the hunter password.') || '').trim().toLowerCase();
+          if (!attempt) { $('err').textContent = 'A password is needed to join this room as a hunter.'; return; }
+          if (await hashPw(attempt, d.pwSalt) !== d.pwHash) { $('err').textContent = 'Wrong password.'; return; }
+          verified = d.pwHash;
+        }
+      }
+    } catch (e) { $('err').textContent = 'Could not check the room: ' + e.message; return; }
+  }
   if (r === 'runner' && !resume) {
     try {
       const g = await ref.get();
@@ -273,6 +296,7 @@ async function begin(r) {
   if (needsCompassTap) $('compass').hidden = false; else enableCompass();
   $('home').hidden = true;
   $('game').hidden = false;
+  $('room').textContent = 'Room ' + code;
   $('ctl').hidden = true;
   initMap();
   watchMe();
@@ -289,7 +313,7 @@ async function begin(r) {
     $('bar').style.color = isLight(myColor) ? '#17231c' : '#fff';
     tick = setInterval(runnerTick, 1000);
   } else {
-    saveSession({ code, role: 'hunter' });
+    saveSession({ code, role: 'hunter', pwHash: verified });
     claimHost();
     hb = setInterval(() => {   // keeps a long game's room from looking abandoned
       if (game.host === hunterId && phase() !== 'ended') gameRef.set({ expireAt: exp() }, { merge: true }).catch(() => {});
@@ -311,6 +335,29 @@ function watchGame() {
     offline = snap.metadata.fromCache;
     if (role === 'hunter') refreshControls();
   }, e => setStatus('Connection error: ' + e.message));
+}
+
+// Hunter password: only a salted hash is stored in the database, never the password itself
+async function hashPw(pw, salt) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + pw));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function savePassword() {
+  const pw = $('pwInput').value.trim().toLowerCase();
+  const del = firebase.firestore.FieldValue.delete();
+  try {
+    let h = null;
+    if (!pw) await gameRef.set({ pwHash: del, pwSalt: del, expireAt: exp() }, { merge: true });
+    else {
+      const salt = Math.random().toString(36).slice(2, 12);
+      h = await hashPw(pw, salt);
+      await gameRef.set({ pwSalt: salt, pwHash: h, expireAt: exp() }, { merge: true });
+    }
+    $('pwInput').value = '';
+    const cur = loadSession();   // the host stays verified on this phone
+    if (cur && cur.code === roomCode) saveSession(Object.assign({}, cur, { pwHash: h }));
+  } catch (e) { setStatus('Could not save the password: ' + e.message); }
 }
 
 // A code counts as free if no room uses it, or the room using it has sat unused long enough to be wiped
@@ -379,6 +426,7 @@ function refreshControls() {
   $('ctl').hidden = ['startBtn', 'settingsBtn', 'endBtn', 'newBtn', 'takeBtn'].every(id => $(id).hidden);
   $('settings').hidden = !(host && ph === 'lobby' && settingsOpen);
   if (!$('settings').hidden) {
+    $('pwState').textContent = game.pwHash ? 'A password is set. Leave the box blank and tap Save to remove it.' : 'No password set, so anyone with the code can join as a hunter.';
     if (document.activeElement !== $('graceSel')) $('graceSel').value = String(game.graceSec != null ? game.graceSec : 300);
     if (document.activeElement !== $('intSel')) $('intSel').value = String(game.intervalSec != null ? game.intervalSec : 120);
   }
